@@ -113,7 +113,8 @@ class MonitorEngine:
             candidates = [
                 item.copy()
                 for item in self.targets
-                if (target_name is None or item.get("name") == target_name)
+                if item.get("enabled", True)
+                and (target_name is None or item.get("name") == target_name)
                 and (check_type is None or str(item.get("check_type", "")).lower() == check_type.lower())
             ]
         return len(self._queue_checks(candidates, None))
