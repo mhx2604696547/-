@@ -1,0 +1,39 @@
+# Python bytecode and tooling caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# PyInstaller output
+build/
+dist/
+
+# Runtime data and secrets
+config/
+data/
+logs/
+*.log
+.env
+.env.*
+
+# Local verification artifacts
+verification/
+
+# Release binaries and archives (installer/*.iss script IS tracked)
+release/
+*.zip
+.gh-auth-temp/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
