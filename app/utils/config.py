@@ -60,8 +60,8 @@ DEFAULT_SETTINGS = {
     "ping_count": 1,
     "ping_timeout_ms": 2000,
     # Daily WeCom inspection report (C08)
-    "daily_report_enabled": False,
-    "daily_report_time": "18:00",
+    "daily_report_enabled": True,
+    "daily_report_time": "08:00",
     # Slow-response / degraded warning (C07); 0 = disabled
     "slow_warning_threshold_ms": 0,
     "slow_warning_consecutive": 3,

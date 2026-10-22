@@ -114,6 +114,17 @@ class MonitorDatabase:
                 )
                 """
             )
+            # Small durable key-value bag for cross-restart flags such as
+            # "the daily report for YYYY-MM-DD was already sent".
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             connection.commit()
         finally:
             connection.close()
@@ -164,6 +175,31 @@ class MonitorDatabase:
                     target_key, max(0, int(state.get("failures", 0))), int(bool(state.get("alerted", False))),
                     last_alert, self._timestamp(),
                 ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def load_app_state(self) -> dict[str, str]:
+        """Return the whole key-value bag used for cross-restart flags."""
+        connection = self._connect()
+        try:
+            rows = connection.execute("SELECT key, value FROM app_state").fetchall()
+            return {str(row[0]): str(row[1]) for row in rows}
+        finally:
+            connection.close()
+
+    def save_app_state(self, key: str, value: str) -> None:
+        """Upsert one cross-restart flag."""
+        connection = self._connect()
+        try:
+            connection.execute(
+                """INSERT INTO app_state (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at""",
+                (key, value, self._timestamp()),
             )
             connection.commit()
         finally:

@@ -6,11 +6,12 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Callable
 
 from app.core import http_check, ping_check, snmp_check, tcp_check
 from app.core.alert import AlertEngine
+from app.core.daily_report import build_daily_report
 from app.utils.database import MonitorDatabase
 
 
@@ -20,7 +21,53 @@ CHECKERS: dict[str, Callable[[str], dict[str, object]]] = {
 }
 
 CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
-_INSPECTION_RUN_KEY = "_inspection_run_id"
+INSPECTION_RUN_KEY = "_inspection_run_id"
+REPORT_CHECK_INTERVAL_SECONDS = 30
+LAST_REPORT_DATE_KEY = "last_daily_report_date"
+
+
+def _parse_report_time(raw: str) -> tuple[int, int] | None:
+    """Parse "HH:MM" into (hour, minute); return None on malformed input."""
+    try:
+        hour_str, minute_str = str(raw).split(":", 1)
+        hour, minute = int(hour_str), int(minute_str)
+    except (ValueError, AttributeError):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
+
+
+def should_send_daily_report(
+    now: datetime,
+    report_time: str,
+    last_sent_date: date | None,
+    suppressed_today: bool,
+    enabled: bool,
+) -> bool:
+    """Pure decision: should the daily report fire right now?
+
+    Args:
+        now: current wall-clock time.
+        report_time: configured "HH:MM" send time.
+        last_sent_date: date the report was last successfully sent, or None.
+        suppressed_today: True when startup already passed today's time point
+            (we do not back-fill a report for the day on a late boot).
+        enabled: whether the daily report is enabled at all.
+    """
+    if not enabled:
+        return False
+    today = now.date()
+    if last_sent_date == today:
+        return False
+    if suppressed_today:
+        return False
+    parsed = _parse_report_time(report_time)
+    if parsed is None:
+        return False
+    hour, minute = parsed
+    due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return now >= due
 
 
 class MonitorEngine:
@@ -47,6 +94,9 @@ class MonitorEngine:
         self._next_cleanup: float = 0.0
         self._inflight: set[str] = set()
         self._last_inspection_run_id: str | None = None
+        self._last_report_date: date | None = None
+        self._report_suppressed_today: bool = False
+        self._next_report_check: float = 0.0
         # A bounded pool keeps slow HTTP checks from delaying unrelated targets.
         self._executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="monitor-check")
 
@@ -63,6 +113,7 @@ class MonitorEngine:
             # main.py already ran a cleanup pass at process startup; the next
             # one is due a full interval from now, not immediately again.
             self._next_cleanup = time.monotonic() + CLEANUP_INTERVAL_SECONDS
+            self._init_daily_report_state()
             stop_event = self._stop_event
             self._wake_event.set()
             self._thread = threading.Thread(target=self._run, args=(stop_event,), name="monitor-scheduler", daemon=True)
@@ -222,7 +273,7 @@ class MonitorEngine:
         for target in targets:
             task_target = target.copy()
             if inspection_run_id:
-                task_target[_INSPECTION_RUN_KEY] = inspection_run_id
+                task_target[INSPECTION_RUN_KEY] = inspection_run_id
             try:
                 future = self._executor.submit(self._check_target, task_target, stop_event)
             except Exception:
@@ -242,6 +293,9 @@ class MonitorEngine:
             if now >= self._next_cleanup:
                 self._next_cleanup = now + CLEANUP_INTERVAL_SECONDS
                 self._executor.submit(self._run_cleanup)
+            if now >= self._next_report_check:
+                self._next_report_check = now + REPORT_CHECK_INTERVAL_SECONDS
+                self._check_daily_report_due()
             with self._lock:
                 due_targets = []
                 for target in self.targets:
@@ -265,10 +319,91 @@ class MonitorEngine:
         except Exception:
             self.logger.exception("周期性历史清理失败")
 
+    def _init_daily_report_state(self) -> None:
+        """Restore the last-sent date; suppress today's report on a late boot."""
+        try:
+            state = self.database.load_app_state()
+        except Exception:
+            self.logger.exception("读取每日报告发送日期失败")
+            state = {}
+        raw_date = state.get(LAST_REPORT_DATE_KEY, "")
+        last_sent: date | None = None
+        if raw_date:
+            try:
+                last_sent = date.fromisoformat(raw_date)
+            except ValueError:
+                last_sent = None
+        self._last_report_date = last_sent
+        now = datetime.now()
+        if last_sent == now.date():
+            self._report_suppressed_today = True
+            return
+        parsed = _parse_report_time(str(self.alert_engine.settings.get("daily_report_time", "08:00")))
+        if parsed is None:
+            self._report_suppressed_today = False
+            return
+        hour, minute = parsed
+        due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        # Booting after today's send time means we missed the window; do not
+        # back-fill a report at startup, wait for tomorrow's window instead.
+        self._report_suppressed_today = now > due
+
+    def _send_daily_report(self) -> None:
+        """Build and send the daily WeCom report; never raise into the scheduler."""
+        try:
+            settings = self.alert_engine.settings
+            # Kick off today's web inspection if it has not started yet; the
+            # report below uses the current snapshot and does not wait for it.
+            try:
+                today = date.today()
+                latest = self.database.get_latest_inspection_run(on_date=today)
+                if latest is None or latest.get("status") in (None, "not_started"):
+                    self.check_websites_now()
+            except Exception:
+                self.logger.exception("触发今日网页巡检失败，继续发送报告")
+
+            snapshot = self.database.get_dashboard_snapshot(self.targets)
+            first_failures = self.database.get_first_failures(date.today())
+            report = build_daily_report(snapshot, first_failures, settings, now=datetime.now())
+            delivered = bool(self.alert_engine.notifier.send_markdown(report))
+            if delivered:
+                today_iso = date.today().isoformat()
+                self._last_report_date = date.today()
+                self._report_suppressed_today = True
+                try:
+                    self.database.save_app_state(LAST_REPORT_DATE_KEY, today_iso)
+                except Exception:
+                    self.logger.exception("保存每日报告发送日期失败")
+                self.logger.info("每日巡检报告已发送（%s）", today_iso)
+            else:
+                self.logger.warning("每日巡检报告发送失败（未配置 Webhook 或企业微信返回失败）")
+        except Exception:
+            self.logger.exception("生成或发送每日巡检报告失败")
+
+    def _check_daily_report_due(self) -> None:
+        """Evaluate the daily report trigger; resets suppression across midnight."""
+        settings = self.alert_engine.settings
+        wall_now = datetime.now()
+        # The suppression flag from yesterday must not block today's window.
+        if self._last_report_date != wall_now.date() and self._report_suppressed_today:
+            self._report_suppressed_today = False
+        if should_send_daily_report(
+            wall_now,
+            str(settings.get("daily_report_time", "08:00")),
+            self._last_report_date,
+            self._report_suppressed_today,
+            bool(settings.get("daily_report_enabled", False)),
+        ):
+            # Claim the window now so a second wake within 30s does not
+            # submit duplicate report jobs; last_sent_date is only updated
+            # after a successful send.
+            self._report_suppressed_today = True
+            self._executor.submit(self._send_daily_report)
+
     def _check_target(self, task_target: dict[str, Any], stop_event: threading.Event | None) -> None:
         """Execute one network check; internal persistence failures never change it to down."""
         target = task_target.copy()
-        inspection_run_id = str(target.pop(_INSPECTION_RUN_KEY, "") or "") or None
+        inspection_run_id = str(target.pop(INSPECTION_RUN_KEY, "") or "") or None
         if stop_event and stop_event.is_set():
             return
 
