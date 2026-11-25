@@ -1,0 +1,202 @@
+<html style="margin:0;padding:0;background:#0b1220;color:#e2e8f0;font-family:'Microsoft YaHei','Segoe UI',sans-serif;">
+<title>NetworkMonitor 架构与模块接口图</title>
+<div style="max-width:1200px;margin:0 auto;padding:24px;box-sizing:border-box;">
+
+  <h1 style="font-size:22px;margin:0 0 4px;color:#f8fafc;">NetworkMonitor 架构与模块接口</h1>
+  <div style="font-size:13px;color:#94a3b8;margin-bottom:24px;">
+    本地 Windows 桌面网络监控 · Python 3.13 + Tkinter + SQLite · 94 项单元测试 · 单文件 PyInstaller 打包
+  </div>
+
+  <!-- ============ 1. 系统架构图 ============ -->
+  <h2 style="font-size:17px;color:#22d3ee;margin:28px 0 12px;border-left:3px solid #22d3ee;padding-left:10px;">1. 系统架构（运行时数据流）</h2>
+
+  <!-- 外部被测目标 -->
+  <div style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:14px;">
+    <div style="font-size:12px;color:#94a3b8;margin-bottom:8px;">外部被测目标（网络邻居）</div>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;">
+      <div style="flex:1;min-width:140px;background:#0f2740;border:1px solid #1e4976;border-radius:6px;padding:10px;text-align:center;">
+        <div style="font-size:14px;">📡 网络设备</div>
+        <div style="font-size:11px;color:#94a3b8;margin-top:4px;">交换机 / 路由器 / 防火墙<br>ICMP · SNMP v1/v2c :161</div>
+      </div>
+      <div style="flex:1;min-width:140px;background:#0f2740;border:1px solid #1e4976;border-radius:6px;padding:10px;text-align:center;">
+        <div style="font-size:14px;">🖥️ 服务器</div>
+        <div style="font-size:11px;color:#94a3b8;margin-top:4px;">Linux / Windows 主机<br>ICMP · TCP · SNMP HOST-RESOURCES</div>
+      </div>
+      <div style="flex:1;min-width:140px;background:#0f2740;border:1px solid #1e4976;border-radius:6px;padding:10px;text-align:center;">
+        <div style="font-size:14px;">🌐 Web 服务</div>
+        <div style="font-size:11px;color:#94a3b8;margin-top:4px;">门户 / 登录页 / API<br>HTTP GET · 状态码 · 页面标识文字</div>
+      </div>
+      <div style="flex:1;min-width:140px;background:#0f2740;border:1px solid #1e4976;border-radius:6px;padding:10px;text-align:center;">
+        <div style="font-size:14px;">🔌 任意 TCP 端口</div>
+        <div style="font-size:11px;color:#94a3b8;margin-top:4px;">主机:端口 · IPv4/IPv6<br>端口测试工具并发扫描</div>
+      </div>
+    </div>
+  </div>
+
+  <div style="text-align:center;color:#64748b;font-size:18px;line-height:1;margin:6px 0;">▲ ICMP / TCP / HTTP / SNMP 请求 ▼</div>
+
+  <!-- Windows 进程内 -->
+  <div style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:14px;">
+    <div style="font-size:12px;color:#94a3b8;margin-bottom:10px;">NetworkMonitor.exe 进程内（单进程 · 守护调度线程 + 8 线程检测池 + Tk 主线程）</div>
+
+    <!-- GUI 层 -->
+    <div style="background:#0b2a3a;border:1px solid #0e5c7a;border-radius:6px;padding:10px;margin-bottom:8px;">
+      <div style="font-size:12px;color:#22d3ee;margin-bottom:6px;">表现层 · Tkinter GUI</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:12px;">
+        <span style="background:#0f3a4d;padding:5px 10px;border-radius:4px;">MainWindow 工作台</span>
+        <span style="background:#0f3a4d;padding:5px 10px;border-radius:4px;">MonitorWall 值守大屏(F11)</span>
+        <span style="background:#0f3a4d;padding:5px 10px;border-radius:4px;">DashboardPanel 数据面板</span>
+        <span style="background:#0f3a4d;padding:5px 10px;border-radius:4px;">ConfigDialog 目标/系统设置</span>
+        <span style="background:#0f3a4d;padding:5px 10px;border-radius:4px;">PortTestDialog</span>
+        <span style="background:#0f3a4d;padding:5px 10px;border-radius:4px;">TrayIcon 系统托盘</span>
+      </div>
+    </div>
+
+    <!-- 调度与业务层 -->
+    <div style="background:#2a1a3a;border:1px solid #5b2a7a;border-radius:6px;padding:10px;margin-bottom:8px;">
+      <div style="font-size:12px;color:#c084fc;margin-bottom:6px;">调度与业务层</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:12px;">
+        <span style="background:#3a1f4d;padding:5px 10px;border-radius:4px;">MonitorEngine 调度/网页巡检/每日报告触发</span>
+        <span style="background:#3a1f4d;padding:5px 10px;border-radius:4px;">AlertEngine 失败阈值/冷却/恢复</span>
+        <span style="background:#3a1f4d;padding:5px 10px;border-radius:4px;">DesktopAlertPolicy 本机声光告警</span>
+        <span style="background:#3a1f4d;padding:5px 10px;border-radius:4px;">build_daily_report 报告 Markdown</span>
+      </div>
+    </div>
+
+    <!-- 检测层 -->
+    <div style="background:#1a2a1a;border:1px solid #2a5b2a;border-radius:6px;padding:10px;margin-bottom:8px;">
+      <div style="font-size:12px;color:#4ade80;margin-bottom:6px;">检测层（纯函数 · 可单测 · 线程池并行）</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:12px;">
+        <span style="background:#1f3a1f;padding:5px 10px;border-radius:4px;">ping_check</span>
+        <span style="background:#1f3a1f;padding:5px 10px;border-radius:4px;">tcp_check</span>
+        <span style="background:#1f3a1f;padding:5px 10px;border-radius:4px;">http_check</span>
+        <span style="background:#1f3a1f;padding:5px 10px;border-radius:4px;">snmp_check</span>
+        <span style="background:#1f3a1f;padding:5px 10px;border-radius:4px;">port_scan</span>
+      </div>
+    </div>
+
+    <!-- 集成层 -->
+    <div style="background:#3a2a1a;border:1px solid #7a5b1e;border-radius:6px;padding:10px;margin-bottom:8px;">
+      <div style="font-size:12px;color:#fbbf24;margin-bottom:6px;">集成出口</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:12px;">
+        <span style="background:#4d3a1f;padding:5px 10px;border-radius:4px;">WeChatNotifier · 企业微信机器人 Webhook（自动脱敏）</span>
+      </div>
+    </div>
+
+    <!-- 基础设施 -->
+    <div style="background:#2a2a2a;border:1px solid #4a4a4a;border-radius:6px;padding:10px;">
+      <div style="font-size:12px;color:#cbd5e1;margin-bottom:6px;">基础设施</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:12px;">
+        <span style="background:#3a3a3a;padding:5px 10px;border-radius:4px;">ConfigManager targets.json / settings.json（原子写 + .bak）</span>
+        <span style="background:#3a3a3a;padding:5px 10px;border-radius:4px;">MonitorDatabase SQLite WAL</span>
+        <span style="background:#3a3a3a;padding:5px 10px;border-radius:4px;">logger 滚动日志</span>
+        <span style="background:#3a3a3a;padding:5px 10px;border-radius:4px;">shortcut 桌面 .lnk</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 持久化与出口 -->
+  <div style="display:flex;gap:10px;margin-top:8px;flex-wrap:wrap;">
+    <div style="flex:1;min-width:220px;background:#1e293b;border:1px solid #334155;border-radius:8px;padding:12px;">
+      <div style="font-size:12px;color:#94a3b8;margin-bottom:6px;">本地持久化（EXE 同级目录）</div>
+      <div style="font-size:12px;line-height:1.8;">
+        📁 <span style="color:#22d3ee;">config/</span> targets.json · settings.json<br>
+        🗄️ <span style="color:#22d3ee;">data/monitor.db</span> check_history · inspection_runs · alert_states · app_state<br>
+        📜 <span style="color:#22d3ee;">logs/monitor.log</span> 2MB 滚动 ×5
+      </div>
+    </div>
+    <div style="flex:1;min-width:220px;background:#1e293b;border:1px solid #334155;border-radius:8px;padding:12px;">
+      <div style="font-size:12px;color:#94a3b8;margin-bottom:6px;">外部通知出口</div>
+      <div style="font-size:12px;line-height:1.8;">
+        📣 <span style="color:#fbbf24;">企业微信群机器人</span> 故障 / 恢复 / 每日 08:00 巡检报告<br>
+        🔔 本机提示音 · 窗口标题闪烁 · 托盘通知（即使无 Webhook 也工作）
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 2. 代码模块依赖图 ============ -->
+  <h2 style="font-size:17px;color:#22d3ee;margin:36px 0 12px;border-left:3px solid #22d3ee;padding-left:10px;">2. 代码模块依赖（app/ 包内箭头）</h2>
+
+  <div style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:18px;font-size:13px;line-height:1.9;">
+    <div style="text-align:center;margin-bottom:14px;">
+      <span style="background:#0f3a4d;padding:6px 14px;border-radius:6px;border:1px solid #0e5c7a;">app/main.py（run()）</span>
+    </div>
+    <div style="text-align:center;color:#64748b;">↓ 实例化并装配</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:10px;">
+      <div style="background:#0b2a3a;border:1px solid #0e5c7a;border-radius:6px;padding:10px;">
+        <div style="color:#22d3ee;font-size:12px;margin-bottom:4px;">gui/</div>
+        <div style="font-size:12px;">MainWindow · MonitorWallPanel · DashboardPanel<br>ConfigDialog · PortTestDialog · TrayIcon<br>theme · 只读 event_queue / snapshot</div>
+      </div>
+      <div style="background:#2a1a3a;border:1px solid #5b2a7a;border-radius:6px;padding:10px;">
+        <div style="color:#c084fc;font-size:12px;margin-bottom:4px;">core/</div>
+        <div style="font-size:12px;">MonitorEngine · AlertEngine · DesktopAlertPolicy<br>daily_report · ping/tcp/http/snmp_check · port_scan</div>
+      </div>
+      <div style="background:#3a2a1a;border:1px solid #7a5b1e;border-radius:6px;padding:10px;">
+        <div style="color:#fbbf24;font-size:12px;margin-bottom:4px;">integrations/</div>
+        <div style="font-size:12px;">WeChatNotifier.send_markdown()</div>
+      </div>
+      <div style="background:#2a2a2a;border:1px solid #4a4a4a;border-radius:6px;padding:10px;">
+        <div style="color:#cbd5e1;font-size:12px;margin-bottom:4px;">utils/</div>
+        <div style="font-size:12px;">ConfigManager · MonitorDatabase · logger · shortcut</div>
+      </div>
+    </div>
+    <div style="margin-top:14px;font-size:12px;color:#94a3b8;border-top:1px dashed #334155;padding-top:10px;">
+      <b style="color:#e2e8f0;">关键依赖规则：</b>
+      ① <code>gui/</code> 不直接发网络请求，只消费 <code>database.get_dashboard_snapshot()</code> 与 event_queue；
+      ② <code>core/*_check.py</code> 是纯函数，不 import GUI；
+      ③ <code>AlertEngine</code> 与 <code>MonitorEngine</code> 通过 <code>database</code> 持久化告警状态，重启不丢失败计数；
+      ④ <code>daily_report.build_daily_report</code> 不触发任何网络 IO，只拼装 Markdown。
+    </div>
+  </div>
+
+  <!-- ============ 3. 接口表 ============ -->
+  <h2 style="font-size:17px;color:#22d3ee;margin:36px 0 12px;border-left:3px solid #22d3ee;padding-left:10px;">3. 公开接口表</h2>
+
+  <div style="overflow-x:auto;">
+  <table style="width:100%;border-collapse:collapse;font-size:12.5px;background:#1e293b;border-radius:8px;overflow:hidden;">
+    <thead>
+      <tr style="background:#0f3a4d;color:#22d3ee;text-align:left;">
+        <th style="padding:8px 10px;">模块</th>
+        <th style="padding:8px 10px;">类 / 函数</th>
+        <th style="padding:8px 10px;">关键签名</th>
+        <th style="padding:8px 10px;">职责</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr style="border-top:1px solid #334155;"><td rowspan="1" style="padding:8px 10px;color:#c084fc;">main</td>
+        <td style="padding:8px 10px;">run()</td><td style="padding:8px 10px;"><code>run() -&gt; None</code></td><td style="padding:8px 10px;">装配所有组件，启动 Tk 主循环</td></tr>
+
+      <tr style="border-top:1px solid #334155;"><td rowspan="6" style="padding:8px 10px;color:#4ade80;">core / 检测</td>
+        <td style="padding:8px 10px;">ping_check</td><td style="padding:8px 10px;"><code>check(address, *, count=1, timeout_ms=2000) -&gt; dict</code></td><td style="padding:8px 10px;">调系统 ping，解析延迟/丢包</td></tr>
+      <tr><td style="padding:8px 10px;">tcp_check</td><td style="padding:8px 10px;"><code>check(address) -&gt; dict</code></td><td style="padding:8px 10px;">3s 连接超时，支持 [IPv6]:port</td></tr>
+      <tr><td style="padding:8px 10px;">http_check</td><td style="padding:8px 10px;"><code>check(url, *, timeout, expected_text, verify_tls) -&gt; dict</code></td><td style="padding:8px 10px;">GET · 2xx/3xx 正常 · 可选页面文字匹配</td></tr>
+      <tr><td style="padding:8px 10px;">snmp_check</td><td style="padding:8px 10px;"><code>check(host, *, port, version, community, device_role) -&gt; dict</code></td><td style="padding:8px 10px;">sysDescr 可达性 + 交换机端口统计 / 服务器 CPU/内存</td></tr>
+      <tr><td style="padding:8px 10px;">port_scan</td><td style="padding:8px 10px;"><code>parse_ports(spec) · check_port(host, port) · scan_ports(...)</code></td><td style="padding:8px 10px;">端口范围解析 + 并发 TCP 探测</td></tr>
+
+      <tr style="border-top:1px solid #334155;"><td rowspan="4" style="padding:8px 10px;color:#c084fc;">core / 调度告警</td>
+        <td style="padding:8px 10px;">MonitorEngine</td><td style="padding:8px 10px;"><code>__init__(targets, database, alert_engine, event_queue, logger)</code><br><code>start() · stop() · update_targets()<br>check_now() · check_websites_now() · retry_inspection_failures()</code></td><td style="padding:8px 10px;">后台调度 · 8 worker 线程池 · 每日报告触发 · 网页巡检批次</td></tr>
+      <tr><td style="padding:8px 10px;">AlertEngine</td><td style="padding:8px 10px;"><code>process(target, result) -&gt; str | None</code></td><td style="padding:8px 10px;">连续失败阈值 · 冷却 · 恢复通知 · SQLite 持久化状态</td></tr>
+      <tr><td style="padding:8px 10px;">DesktopAlertPolicy</td><td style="padding:8px 10px;"><code>process(target, result) -&gt; str | None</code></td><td style="padding:8px 10px;">本机声光告警策略（与 Tk 解耦）</td></tr>
+      <tr><td style="padding:8px 10px;">daily_report</td><td style="padding:8px 10px;"><code>build_daily_report(snapshot, first_failures, settings, now=None) -&gt; str</code></td><td style="padding:8px 10px;">拼企微 Markdown 报告（含 4KB 截断保护）</td></tr>
+
+      <tr style="border-top:1px solid #334155;"><td rowspan="2" style="padding:8px 10px;color:#fbbf24;">integrations</td>
+        <td style="padding:8px 10px;">WeChatNotifier</td><td style="padding:8px 10px;"><code>send_markdown(content) -&gt; bool</code></td><td style="padding:8px 10px;">POST 企微机器人 · key 脱敏日志</td></tr>
+
+      <tr style="border-top:1px solid #334155;"><td rowspan="2" style="padding:8px 10px;color:#94a3b8;">utils</td>
+        <td style="padding:8px 10px;">ConfigManager</td><td style="padding:8px 10px;"><code>load_targets() / save_targets()<br>load_settings() / save_settings()</code></td><td style="padding:8px 10px;">JSON 原子写 · .bak 备份 · 损坏文件保留</td></tr>
+      <tr><td style="padding:8px 10px;">MonitorDatabase</td><td style="padding:8px 10px;"><code>get_dashboard_snapshot(targets, now=None)<br>get_first_failures(on_date) · get_latest_inspection_run(on_date)<br>save_result · create_inspection_run · record_inspection_result<br>load/save_alert_state · load/save_app_state · cleanup_history</code></td><td style="padding:8px 10px;">SQLite WAL · 所有只读面板的唯一数据源</td></tr>
+
+      <tr style="border-top:1px solid #334155;"><td rowspan="3" style="padding:8px 10px;color:#22d3ee;">gui</td>
+        <td style="padding:8px 10px;">MainWindow</td><td style="padding:8px 10px;"><code>__init__(root, targets, settings, db, monitor, queue, save_fn, logger)</code></td><td style="padding:8px 10px;">工作台主窗 · 轮询 event_queue · F11 切大屏</td></tr>
+      <tr><td style="padding:8px 10px;">MonitorWallPanel</td><td style="padding:8px 10px;"><code>refresh(snapshot, monitoring_running, storage_error)</code></td><td style="padding:8px 10px;">深色值守大屏 · 状态矩阵 · 24h 热力</td></tr>
+      <tr><td style="padding:8px 10px;">ConfigDialog / DashboardPanel / PortTestDialog / TrayIcon</td><td style="padding:8px 10px;">各 Toplevel / Frame 子类</td><td style="padding:8px 10px;">目标编辑 · 数据面板 · 端口扫描 · 托盘菜单</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div style="margin-top:20px;font-size:12px;color:#64748b;">
+    生成依据：当前 main 分支（commit 1e6cac4）实际源码 · 94 项单元测试全绿。
+  </div>
+
+</div>
+</html>

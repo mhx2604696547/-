@@ -1,8 +1,12 @@
-"""HTTP(S) checks used by the daily website-inspection workflow."""
+"""HTTP(S) checks with optional expected-text matching and TLS certificate expiry detection."""
 from __future__ import annotations
 
+import socket
+import ssl
 import time
+from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -32,6 +36,40 @@ def _as_bool(value: Any, default: bool = True) -> bool:
     return bool(value)
 
 
+def parse_tls_not_after_days(not_after: str, now: datetime | None = None) -> int | None:
+    """Parse an OpenSSL 'notAfter' timestamp string into whole days remaining."""
+    if not not_after:
+        return None
+    try:
+        expiry_ts = ssl.cert_time_to_seconds(not_after)
+        expiry_dt = datetime.fromtimestamp(expiry_ts, tz=timezone.utc)
+        current = now if now is not None else datetime.now(tz=timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        return int((expiry_dt - current).total_seconds() // 86400)
+    except (ValueError, OSError):
+        return None
+
+
+def probe_tls_days_left(url: str, timeout: float = 3.0) -> int | None:
+    """Best-effort TLS certificate expiry probe for HTTPS URLs. Never raises."""
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        return None
+    host = parsed.hostname
+    port = parsed.port or 443
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((host, port), timeout=min(timeout, 3.0)) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as tls_sock:
+                cert = tls_sock.getpeercert()
+        if not cert:
+            return None
+        return parse_tls_not_after_days(str(cert.get("notAfter") or ""))
+    except Exception:
+        return None
+
+
 def check(
     address: str,
     *,
@@ -39,12 +77,7 @@ def check(
     expected_text: str = "",
     verify_tls: bool | str = True,
 ) -> dict[str, object]:
-    """Check a web or device-login page without using or storing credentials.
-
-    A successful 2xx/3xx response is considered reachable.  When ``expected_text``
-    is configured, its case-insensitive presence in the returned HTML is also
-    required; this distinguishes a real login/portal page from a proxy error page.
-    """
+    """Check a web or device-login page without using or storing credentials."""
     url = address if address.startswith(("http://", "https://")) else f"http://{address}"
     timeout = _timeout_seconds(timeout_seconds)
     marker = expected_text.strip()
@@ -70,8 +103,16 @@ def check(
         detail = f"HTTP {response.status_code}"
         if marker:
             detail += "；页面标识已匹配"
+        days_left: int | None = None
         if not check_tls:
             detail += "；已忽略 HTTPS 证书校验"
-        return {"status": "up", "latency": latency, "error_msg": "", "detail": detail}
+        elif url.lower().startswith("https://"):
+            days_left = probe_tls_days_left(url, timeout=timeout)
+            if days_left is not None:
+                detail += f"；证书剩 {days_left} 天"
+        result: dict[str, object] = {"status": "up", "latency": latency, "error_msg": "", "detail": detail}
+        if days_left is not None:
+            result["tls_days_left"] = days_left
+        return result
     except requests.RequestException as error:
         return {"status": "down", "latency": None, "error_msg": str(error)}

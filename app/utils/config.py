@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import tempfile
+import zipfile
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ DEFAULT_TARGETS = [
         "address": "192.168.1.1",
         "check_type": "ping",
         "device_role": "other",
+        "group": "默认",
         "interval": 60,
         "alert_enabled": True,
         "enabled": True,
@@ -33,6 +35,7 @@ DEFAULT_TARGETS = [
         "address": "8.8.8.8",
         "check_type": "ping",
         "device_role": "other",
+        "group": "默认",
         "interval": 60,
         "alert_enabled": True,
         "enabled": True,
@@ -69,6 +72,16 @@ DEFAULT_SETTINGS = {
     "correlation_alert_threshold": 3,
     # One-time flag so the shortcut offer dialog is shown only once (C14)
     "shortcut_offered": False,
+    # Startup view: "wall" (monitoring wall) or "workbench" (main workbench)
+    "startup_view": "wall",
+    # Windows HKCU Run autostart (silent to tray)
+    "autostart_enabled": False,
+    # SNMP resource threshold alerts (0 = disabled)
+    "snmp_cpu_threshold": 90,
+    "snmp_mem_threshold": 90,
+    "snmp_disk_threshold": 90,
+    # HTTPS certificate expiry warning window in days (0 = disabled)
+    "tls_expiry_warn_days": 30,
 }
 
 
@@ -166,3 +179,38 @@ class ConfigManager:
             # The caller still receives defaults so the desktop program can
             # start; a later save will retain the last valid .bak copy.
             pass
+
+
+def export_config_bundle(
+    destination: Path,
+    targets: list[dict[str, Any]],
+    settings: dict[str, Any],
+    *,
+    redact_secrets: bool = False,
+) -> None:
+    """Export targets and settings into a portable ZIP archive."""
+    safe_targets = deepcopy(targets)
+    safe_settings = deepcopy(settings)
+    if redact_secrets:
+        safe_settings["wechat_webhook"] = ""
+        for item in safe_targets:
+            if "snmp_community" in item:
+                item["snmp_community"] = ""
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("targets.json", json.dumps(safe_targets, ensure_ascii=False, indent=2))
+        zf.writestr("settings.json", json.dumps(safe_settings, ensure_ascii=False, indent=2))
+
+
+def import_config_bundle(source: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load and validate targets.json and settings.json from a backup ZIP archive."""
+    with zipfile.ZipFile(source, "r") as zf:
+        names = set(zf.namelist())
+        if "targets.json" not in names or "settings.json" not in names:
+            raise ValueError("压缩包缺少 targets.json 或 settings.json。")
+        raw_targets = json.loads(zf.read("targets.json").decode("utf-8"))
+        raw_settings = json.loads(zf.read("settings.json").decode("utf-8"))
+    if not isinstance(raw_targets, list) or not isinstance(raw_settings, dict):
+        raise ValueError("配置包内容格式无效。")
+    merged_settings = deepcopy(DEFAULT_SETTINGS)
+    merged_settings.update(raw_settings)
+    return raw_targets, merged_settings

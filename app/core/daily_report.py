@@ -1,11 +1,46 @@
 """Build the daily WeCom inspection summary report."""
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 
 _MAX_EXCEPTIONS = 20
 _WECOM_LIMIT = 4000
+
+
+def _collect_resource_and_cert_notices(targets: list[dict[str, Any]], settings: dict[str, Any]) -> list[str]:
+    """Scan healthy targets for expiring TLS certificates or high SNMP resource usage."""
+    notices: list[str] = []
+    cpu_lim = max(0, int(settings.get("snmp_cpu_threshold", 90) or 0))
+    mem_lim = max(0, int(settings.get("snmp_mem_threshold", 90) or 0))
+    disk_lim = max(0, int(settings.get("snmp_disk_threshold", 90) or 0))
+    tls_lim = max(0, int(settings.get("tls_expiry_warn_days", 30) or 0))
+
+    for item in targets:
+        if item.get("status") != "up":
+            continue
+        detail = str(item.get("detail") or "")
+        if not detail:
+            continue
+        name = str(item.get("name") or item.get("target_name") or "-")
+        flags: list[str] = []
+        cert_m = re.search(r"证书剩\s*(-?\d+)\s*天", detail)
+        if tls_lim > 0 and cert_m and int(cert_m.group(1)) <= tls_lim:
+            days = int(cert_m.group(1))
+            flags.append(f"证书已过期 {abs(days)} 天" if days < 0 else f"证书剩 {days} 天")
+        cpu_m = re.search(r"CPU\s*(\d+(?:\.\d+)?)\s*%", detail)
+        if cpu_lim > 0 and cpu_m and float(cpu_m.group(1)) >= cpu_lim:
+            flags.append(f"CPU {float(cpu_m.group(1)):.0f}%")
+        mem_m = re.search(r"内存\s*(\d+(?:\.\d+)?)\s*%", detail)
+        if mem_lim > 0 and mem_m and float(mem_m.group(1)) >= mem_lim:
+            flags.append(f"内存 {float(mem_m.group(1)):.0f}%")
+        disk_m = re.search(r"磁盘最高\s*(\d+(?:\.\d+)?)\s*%", detail)
+        if disk_lim > 0 and disk_m and float(disk_m.group(1)) >= disk_lim:
+            flags.append(f"磁盘 {float(disk_m.group(1)):.0f}%")
+        if flags:
+            notices.append(f"> ⚡ **{name}**：{' / '.join(flags)}")
+    return notices
 
 
 def build_daily_report(
@@ -91,8 +126,14 @@ def build_daily_report(
         lines.append("")
         lines.append("> ✅ 当前无异常目标")
 
+    notices = _collect_resource_and_cert_notices(snapshot.get("targets", []), settings)
+    if notices:
+        lines.append("")
+        lines.append("## 资源与证书提醒")
+        lines.extend(notices[:15])
+
     lines.append("")
-    lines.append(f"*由网络监控自动生成于 {date_str} {time_str}*")
+    lines.append(f"*由网哨自动生成于 {date_str} {time_str}*")
 
     report = "\n".join(lines)
     # Hard truncate to stay within WeCom's message size limit

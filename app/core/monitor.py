@@ -24,6 +24,13 @@ CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
 INSPECTION_RUN_KEY = "_inspection_run_id"
 REPORT_CHECK_INTERVAL_SECONDS = 30
 LAST_REPORT_DATE_KEY = "last_daily_report_date"
+WAKE_JUMP_THRESHOLD_SECONDS = 30.0
+WAKE_GRACE_SECONDS = 20.0
+
+
+def detect_sleep_resume(prev_wall: float, curr_wall: float, threshold: float = WAKE_JUMP_THRESHOLD_SECONDS) -> bool:
+    """Return True when wall-clock time jumped forward, indicating OS sleep/hibernate resume."""
+    return (curr_wall - prev_wall) >= threshold
 
 
 def _parse_report_time(raw: str) -> tuple[int, int] | None:
@@ -288,24 +295,33 @@ class MonitorEngine:
         return submitted
 
     def _run(self, stop_event: threading.Event) -> None:
+        last_wall = time.time()
+        resume_grace_until = 0.0
         while not stop_event.is_set():
             now = time.monotonic()
+            curr_wall = time.time()
+            if detect_sleep_resume(last_wall, curr_wall):
+                resume_grace_until = now + WAKE_GRACE_SECONDS
+                self.logger.info("检测到系统休眠唤醒，延迟 %.0f 秒恢复检测以等待网卡就绪", WAKE_GRACE_SECONDS)
+            last_wall = curr_wall
+
             if now >= self._next_cleanup:
                 self._next_cleanup = now + CLEANUP_INTERVAL_SECONDS
                 self._executor.submit(self._run_cleanup)
             if now >= self._next_report_check:
                 self._next_report_check = now + REPORT_CHECK_INTERVAL_SECONDS
                 self._check_daily_report_due()
-            with self._lock:
-                due_targets = []
-                for target in self.targets:
-                    if not target.get("enabled", True):
-                        continue
-                    key = AlertEngine._key(target)
-                    if now >= self._next_run.get(key, 0):
-                        due_targets.append(target.copy())
-                        self._next_run[key] = now + max(1, int(target.get("interval", 60)))
-            self._queue_checks(due_targets, stop_event)
+            if now >= resume_grace_until:
+                with self._lock:
+                    due_targets = []
+                    for target in self.targets:
+                        if not target.get("enabled", True):
+                            continue
+                        key = AlertEngine._key(target)
+                        if now >= self._next_run.get(key, 0):
+                            due_targets.append(target.copy())
+                            self._next_run[key] = now + max(1, int(target.get("interval", 60)))
+                self._queue_checks(due_targets, stop_event)
             self._wake_event.wait(timeout=0.3)
             self._wake_event.clear()
 

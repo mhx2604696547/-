@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import csv
 import queue
+import subprocess
+import sys
 import tkinter as tk
-from datetime import datetime
+import webbrowser
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
@@ -14,19 +17,31 @@ try:  # ``winsound`` is part of Windows Python but not available on Linux.
 except ImportError:  # pragma: no cover - exercised only on non-Windows hosts.
     winsound = None
 
+from app.core.alert import is_target_muted
 from app.core.desktop_alert import DesktopAlertPolicy, as_bool
-from app.gui.config_dialog import DEVICE_ROLE_LABELS, ConfigDialog
+from app.gui.config_dialog import (
+    BatchImportDialog,
+    DEFAULT_GROUP,
+    DEVICE_ROLE_LABELS,
+    SettingsDialog,
+    TargetEditDialog,
+    extract_host,
+    normalize_target,
+)
 from app.gui.dashboard import DashboardPanel, inspection_footer_state
+from app.gui.diagnostics_dialogs import NetworkDiagDialog, TargetHistoryDialog
 from app.gui.monitor_wall import MonitorWallPanel
 from app.gui.port_test_dialog import PortTestDialog
+from app.gui.snmp_dialogs import SnmpDetailDialog, SnmpDiscoveryDialog
 from app.gui.theme import PALETTE, apply_workbench_theme
 from app.gui.tray import TrayIcon
+from app.utils.config import export_config_bundle, import_config_bundle
 from app.utils.database import MonitorDatabase
 
 
 STATUS_TEXT = {"up": "正常", "down": "异常", "unknown": "未知"}
 ABOUT_MESSAGE = (
-    "网络监控系统\n"
+    "网哨 · 网络监控工具\n"
     "本机个人运维工作台\n\n"
     "功能：连通性监控、网页巡检、设备状态检测、断网声光告警\n\n"
     "开发与维护：马海兴\n"
@@ -54,6 +69,8 @@ class MainWindow:
         self._closing = False
         self._filter_state: str | None = None
         self._filter_category: str | None = None
+        self._filter_group: str = "全部"
+        self._search_text: str = ""
         # Only results SQLite could not save live here. Persisted results are
         # read back from SQLite so the normal stale-result rule still applies
         # after a laptop sleep or a long monitoring pause.
@@ -84,7 +101,7 @@ class MainWindow:
         self._poll_events()
 
     def _build_window(self) -> None:
-        self.root.title("网络监控 · 个人运维工作台")
+        self.root.title("网哨 · 个人运维工作台")
         self.root.minsize(860, 560)
         self._fit_window_to_screen()
         self.root.protocol("WM_DELETE_WINDOW", self.minimize_to_tray)
@@ -119,7 +136,10 @@ class MainWindow:
         self._show_page("overview", "overview")
         self.root.bind("<F11>", self._handle_f11)
         self.root.bind("<Escape>", self._handle_escape)
-        self._enter_monitor_wall()
+        if str(self.settings.get("startup_view", "wall")) == "workbench":
+            self._show_page("targets", "targets")
+        else:
+            self._enter_monitor_wall()
 
     def _fit_window_to_screen(self) -> None:
         """Start centered and fully visible on ordinary laptop resolutions."""
@@ -138,14 +158,23 @@ class MainWindow:
         }
         menu = tk.Menu(self.root, **menu_options)
         file_menu = tk.Menu(menu, tearoff=False, **menu_options)
-        file_menu.add_command(label="配置目标", command=self.open_config)
+        file_menu.add_command(label="添加监控目标...", command=self.add_target)
+        file_menu.add_command(label="批量导入目标...", command=self.open_batch_import)
+        file_menu.add_command(label="系统设置...", command=self.open_config)
+        file_menu.add_separator()
         file_menu.add_command(label="导出检测历史", command=self.export_report)
         file_menu.add_command(label="导出今日巡检", command=self.export_today_inspection)
+        file_menu.add_separator()
+        file_menu.add_command(label="备份配置包 (ZIP)...", command=self.export_config_zip)
+        file_menu.add_command(label="导入配置包 (ZIP)...", command=self.import_config_zip)
+        file_menu.add_separator()
         file_menu.add_command(label="最小化到托盘", command=self.minimize_to_tray)
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self.exit_application)
         menu.add_cascade(label="文件", menu=file_menu)
         tools_menu = tk.Menu(menu, tearoff=False, **menu_options)
+        tools_menu.add_command(label="网段 SNMP 自动发现...", command=self.open_snmp_discovery)
+        tools_menu.add_command(label="Ping / 路由追踪工具...", command=lambda: self.open_network_diag())
         tools_menu.add_command(label="端口测试工具", command=self.open_port_test)
         menu.add_cascade(label="工具", menu=tools_menu)
         help_menu = tk.Menu(menu, tearoff=False, **menu_options)
@@ -165,7 +194,7 @@ class MainWindow:
         ).pack(side=tk.LEFT)
         brand_copy = ttk.Frame(brand, style="Topbar.TFrame")
         brand_copy.pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Label(brand_copy, text="网络监控", style="TopbarTitle.TLabel").pack(anchor="w")
+        ttk.Label(brand_copy, text="网哨", style="TopbarTitle.TLabel").pack(anchor="w")
         ttk.Label(brand_copy, text="个人运维工作台", style="TopbarSubtle.TLabel").pack(anchor="w")
 
         status_area = ttk.Frame(topbar, style="Topbar.TFrame")
@@ -209,11 +238,17 @@ class MainWindow:
             background=PALETTE["sidebar"], foreground=PALETTE["sidebar_muted"], font=("Microsoft YaHei UI", 9),
             padx=9, pady=8,
         ).pack(fill=tk.X)
-        config_link = tk.Label(
-            bottom, text="管理目标与设置  ›", justify=tk.LEFT, anchor="w", cursor="hand2",
-            background=PALETTE["sidebar"], foreground="#FFFFFF", font=("Microsoft YaHei UI", 9, "bold"), padx=9, pady=8,
+        add_link = tk.Label(
+            bottom, text="+ 添加监控目标", justify=tk.LEFT, anchor="w", cursor="hand2",
+            background=PALETTE["sidebar_active"], foreground="#FFFFFF", font=("Microsoft YaHei UI", 9, "bold"), padx=9, pady=7,
         )
-        config_link.pack(fill=tk.X, pady=(4, 0))
+        add_link.pack(fill=tk.X, pady=(4, 4))
+        add_link.bind("<Button-1>", lambda _event: self.add_target())
+        config_link = tk.Label(
+            bottom, text="系统设置  ›", justify=tk.LEFT, anchor="w", cursor="hand2",
+            background=PALETTE["sidebar"], foreground=PALETTE["sidebar_text"], font=("Microsoft YaHei UI", 9, "bold"), padx=9, pady=7,
+        )
+        config_link.pack(fill=tk.X, pady=(2, 0))
         config_link.bind("<Button-1>", lambda _event: self.open_config())
 
     def _nav_group(self, parent: ttk.Frame, text: str) -> None:
@@ -256,9 +291,9 @@ class MainWindow:
 
     def _build_target_page(self) -> None:
         self.list_tab.columnconfigure(0, weight=1)
-        self.list_tab.rowconfigure(1, weight=1)
+        self.list_tab.rowconfigure(2, weight=1)
         header = ttk.Frame(self.list_tab, style="Workbench.TFrame")
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 15))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         header.columnconfigure(0, weight=1)
         title_stack = ttk.Frame(header, style="Workbench.TFrame")
         title_stack.grid(row=0, column=0, sticky="w")
@@ -271,22 +306,43 @@ class MainWindow:
         ttk.Label(subtitle, textvariable=self.target_count_var, style="TopbarSubtle.TLabel").pack(side=tk.LEFT, padx=(8, 0))
         actions = ttk.Frame(header, style="Workbench.TFrame")
         actions.grid(row=0, column=1, sticky="e")
-        ttk.Button(actions, text="管理目标", command=self.open_config, style="Secondary.TButton").pack(side=tk.LEFT)
-        ttk.Button(actions, text="立即检测", command=self.check_now, style="Primary.TButton").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(actions, text="+ 添加目标", command=self.add_target, style="Primary.TButton").pack(side=tk.LEFT)
+        ttk.Button(actions, text="SNMP 发现", command=self.open_snmp_discovery, style="Secondary.TButton").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(actions, text="批量导入", command=self.open_batch_import, style="Secondary.TButton").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(actions, text="立即检测", command=self.check_now, style="Secondary.TButton").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(actions, text="系统设置", command=self.open_config, style="Secondary.TButton").pack(side=tk.LEFT, padx=(8, 0))
+
+        toolbar = ttk.Frame(self.list_tab, style="Workbench.TFrame")
+        toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        self.search_var = tk.StringVar(value="")
+        self.search_var.trace_add("write", self._on_search_changed)
+        ttk.Label(toolbar, text="搜索", style="TopbarSubtle.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Entry(toolbar, textvariable=self.search_var, width=24).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="清空", command=self._clear_search, style="Quiet.TButton").pack(side=tk.LEFT, padx=(4, 14))
+        ttk.Label(toolbar, text="分组", style="TopbarSubtle.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        self.group_filter_var = tk.StringVar(value="全部")
+        self.group_combo = ttk.Combobox(
+            toolbar, textvariable=self.group_filter_var, values=("全部",), state="readonly", width=12,
+        )
+        self.group_combo.pack(side=tk.LEFT)
+        self.group_combo.bind("<<ComboboxSelected>>", self._on_group_changed)
+        ttk.Label(
+            toolbar, text="提示：双击编辑目标 · 右键快捷操作与排障", style="TopbarSubtle.TLabel",
+        ).pack(side=tk.RIGHT)
 
         table_card = ttk.Frame(self.list_tab, style="Card.TFrame", padding=(12, 12))
-        table_card.grid(row=1, column=0, sticky="nsew")
+        table_card.grid(row=2, column=0, sticky="nsew")
         table_card.columnconfigure(0, weight=1)
         table_card.rowconfigure(0, weight=1)
-        columns = ("name", "address", "check_type", "device_role", "status", "latency", "check_time", "error", "detail")
+        columns = ("name", "group", "address", "check_type", "device_role", "status", "latency", "check_time", "error", "detail")
         self.tree = ttk.Treeview(table_card, columns=columns, show="headings")
         for key, title, width in (
-            ("name", "名称", 140), ("address", "地址", 160), ("check_type", "类型", 66), ("device_role", "设备类型", 86),
-            ("status", "状态", 86), ("latency", "延迟(ms)", 86), ("check_time", "最后检测时间", 150),
-            ("error", "错误信息", 200), ("detail", "详情", 220),
+            ("name", "名称", 136), ("group", "分组", 76), ("address", "地址", 155), ("check_type", "类型", 60),
+            ("device_role", "设备类型", 78), ("status", "状态", 82), ("latency", "延迟(ms)", 80),
+            ("check_time", "最后检测时间", 142), ("error", "错误信息", 180), ("detail", "详情", 220),
         ):
             self.tree.heading(key, text=title)
-            self.tree.column(key, width=width, anchor=tk.CENTER if key in {"check_type", "device_role", "status", "latency"} else tk.W)
+            self.tree.column(key, width=width, anchor=tk.CENTER if key in {"group", "check_type", "device_role", "status", "latency"} else tk.W)
         vertical = ttk.Scrollbar(table_card, orient=tk.VERTICAL, command=self.tree.yview)
         horizontal = ttk.Scrollbar(table_card, orient=tk.HORIZONTAL, command=self.tree.xview)
         self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
@@ -296,6 +352,9 @@ class MainWindow:
         self.tree.tag_configure("up", foreground=PALETTE["success"])
         self.tree.tag_configure("down", foreground=PALETTE["danger"])
         self.tree.tag_configure("unknown", foreground=PALETTE["warning"])
+        self.tree.tag_configure("disabled", foreground=PALETTE["muted"])
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
+        self.tree.bind("<Button-3>", self._on_tree_right_click)
 
     def _build_inspection_footer(self, parent: ttk.Frame) -> None:
         footer = ttk.Frame(parent, style="Footer.TFrame", padding=(20, 10))
@@ -333,7 +392,7 @@ class MainWindow:
         self.workbench_shell.pack_forget()
         self.monitor_wall.pack(fill=tk.BOTH, expand=True)
         self.root.configure(menu="")
-        self.root.title("监控大屏 · 网络监控")
+        self.root.title("监控大屏 · 网哨")
         self._active_surface = "wall"
         self._set_active_nav("wall")
 
@@ -347,7 +406,7 @@ class MainWindow:
         self.monitor_wall.pack_forget()
         self.workbench_shell.pack(fill=tk.BOTH, expand=True)
         self.root.configure(menu=self._menu)
-        self.root.title("网络监控 · 个人运维工作台")
+        self.root.title("网哨 · 个人运维工作台")
         self._active_surface = "workbench"
 
     def show_monitor_wall(self) -> None:
@@ -412,33 +471,79 @@ class MainWindow:
             return history
         return {"status": "unknown", "latency": None, "error_msg": "", "detail": "", "check_time": ""}
 
+    def _available_groups(self) -> list[str]:
+        groups = {DEFAULT_GROUP}
+        for target in self.targets:
+            group = str(target.get("group") or "").strip()
+            if group:
+                groups.add(group)
+        return sorted(groups)
+
+    def _on_search_changed(self, *_args: object) -> None:
+        self._search_text = self.search_var.get().strip().lower()
+        self._render_targets()
+
+    def _clear_search(self) -> None:
+        self.search_var.set("")
+
+    def _on_group_changed(self, _event: object = None) -> None:
+        self._filter_group = self.group_filter_var.get() or "全部"
+        self._render_targets()
+
     def _render_targets(self) -> None:
         selected = self.tree.selection()
+        if hasattr(self, "group_combo"):
+            group_values = ("全部", *self._available_groups())
+            self.group_combo.configure(values=group_values)
+            if self._filter_group not in group_values:
+                self._filter_group = "全部"
+                self.group_filter_var.set("全部")
         self.tree.delete(*self.tree.get_children())
         visible_count = 0
+        keyword = getattr(self, "_search_text", "")
+        group_filter = getattr(self, "_filter_group", "全部")
         for target in self.targets:
             check_type = str(target.get("check_type", "")).lower()
             if self._filter_category == "web" and check_type != "http":
                 continue
             if self._filter_category == "network" and check_type == "http":
                 continue
+            group = str(target.get("group") or "").strip() or DEFAULT_GROUP
+            if group_filter != "全部" and group != group_filter:
+                continue
+            enabled = as_bool(target.get("enabled", True))
             view = self._target_view(target)
             state = str(view.get("status", "unknown"))
             if state not in STATUS_TEXT:
                 state = "unknown"
-            if self._filter_state is not None and state != self._filter_state:
+            if self._filter_state is not None and (not enabled or state != self._filter_state):
                 continue
+            if keyword:
+                haystack = " ".join([
+                    str(target.get("name", "")), str(target.get("address", "")),
+                    group, str(target.get("notes", "")), str(view.get("detail", "")), str(view.get("error_msg", "")),
+                ]).lower()
+                if keyword not in haystack:
+                    continue
             latency = "-"
             if view.get("latency") is not None:
                 try:
                     latency = f"{float(view['latency']):.2f}"
                 except (TypeError, ValueError):
                     latency = str(view["latency"])
+            muted = is_target_muted(target)
+            if not enabled:
+                status_cell = "○ 已停用"
+            elif muted:
+                status_cell = f"🔇 {STATUS_TEXT[state]}"
+            else:
+                status_cell = f"● {STATUS_TEXT[state]}"
+            row_tag = state if enabled else "disabled"
             self.tree.insert("", tk.END, iid=self._target_id(target), values=(
-                target["name"], target["address"], check_type.upper(), self._role_label(target),
-                f"● {STATUS_TEXT[state]}", latency, str(view.get("check_time", "")).replace("T", " ") or "-",
+                target["name"], group, target["address"], check_type.upper(), self._role_label(target),
+                status_cell, latency, str(view.get("check_time", "")).replace("T", " ") or "-",
                 view.get("error_msg", ""), view.get("detail", ""),
-            ), tags=(state,))
+            ), tags=(row_tag,))
             visible_count += 1
         self.target_count_var.set(f"{visible_count} 个目标")
         self.target_filter_var.set(self._target_filter_label())
@@ -465,6 +570,9 @@ class MainWindow:
             self.dashboard.refresh(snapshot, self.monitor.is_running, storage_error)
             self.monitor_wall.refresh(snapshot, self.monitor.is_running, storage_error)
             self._render_inspection_footer(snapshot["today_inspection"])
+            update_tray = getattr(getattr(self, "tray", None), "update_status", None)
+            if callable(update_tray):
+                update_tray(int(snapshot.get("status_counts", {}).get("down", 0)))
         except Exception as error:
             self.logger.exception("刷新数据面板失败")
             self._snapshot_read_error = f"无法读取数据面板：{error}"
@@ -754,7 +862,7 @@ class MainWindow:
             notify(title, message)
 
     def _normal_window_title(self) -> str:
-        return "监控大屏 · 网络监控" if self._active_surface == "wall" else "网络监控 · 个人运维工作台"
+        return "监控大屏 · 网哨" if self._active_surface == "wall" else "网哨 · 个人运维工作台"
 
     def _flash_alarm_title(self, alert_title: str, flashes: int = 8) -> None:
         """Flash only the title text so alarms never create blocking dialogs."""
@@ -776,13 +884,316 @@ class MainWindow:
         """Show concise identity, support, and current desktop-alert information."""
         messagebox.showinfo("关于", ABOUT_MESSAGE, parent=self.root)
 
+    def _find_target_index(self, target_id: str) -> int | None:
+        for index, target in enumerate(self.targets):
+            if self._target_id(target) == target_id:
+                return index
+        return None
+
+    def _on_tree_double_click(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.tree.identify_row(event.y)
+        if item_id:
+            self.edit_target_by_id(item_id)
+
+    def _on_tree_right_click(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return
+        self.tree.selection_set(item_id)
+        self.tree.focus(item_id)
+        index = self._find_target_index(item_id)
+        if index is None:
+            return
+        target = self.targets[index]
+        enabled = as_bool(target.get("enabled", True))
+        menu = tk.Menu(self.root, tearoff=False)
+        if str(target.get("check_type", "")).lower() == "snmp":
+            menu.add_command(
+                label="查看 SNMP 详情（端口 / 带宽 / 资源）...",
+                command=lambda t=target.copy(): self.open_snmp_detail(t),
+            )
+        menu.add_command(
+            label="查看历史趋势与时间线...",
+            command=lambda t=target.copy(): self.open_target_history(t),
+        )
+        menu.add_separator()
+        menu.add_command(
+            label="立即检测此目标",
+            command=lambda name=target["name"]: self._check_single_target(name),
+            state=tk.NORMAL if enabled else tk.DISABLED,
+        )
+        menu.add_command(label="编辑目标...", command=lambda tid=item_id: self.edit_target_by_id(tid))
+        menu.add_command(
+            label="停用此目标" if enabled else "启用此目标",
+            command=lambda tid=item_id: self.toggle_target_enabled(tid),
+        )
+        mute_menu = tk.Menu(menu, tearoff=False)
+        mute_menu.add_command(label="静默 30 分钟", command=lambda tid=item_id: self.mute_target_by_id(tid, 30))
+        mute_menu.add_command(label="静默 2 小时", command=lambda tid=item_id: self.mute_target_by_id(tid, 120))
+        if is_target_muted(target):
+            mute_menu.add_separator()
+            mute_menu.add_command(label="取消静默", command=lambda tid=item_id: self.mute_target_by_id(tid, 0))
+        menu.add_cascade(label="维护静默（不告警）", menu=mute_menu)
+        menu.add_command(label="复制目标...", command=lambda tid=item_id: self.duplicate_target_by_id(tid))
+        menu.add_separator()
+        host = extract_host(str(target.get("address", "")))
+        menu.add_command(label="持续 Ping 诊断", command=lambda h=host: self.open_network_diag(h, "ping"))
+        menu.add_command(label="路由追踪 (Tracert)", command=lambda h=host: self.open_network_diag(h, "tracert"))
+        menu.add_command(label="端口测试工具", command=lambda h=host: self.open_port_test(h))
+        menu.add_command(label="SSH 连接", command=lambda h=host: self.open_ssh_terminal(h))
+        menu.add_command(label="远程桌面 (RDP)", command=lambda h=host: self.open_rdp_session(h))
+        menu.add_command(label="在浏览器打开", command=lambda tid=item_id: self.open_target_in_browser(tid))
+        menu.add_command(label="复制地址", command=lambda tid=item_id: self.copy_target_address(tid))
+        menu.add_separator()
+        menu.add_command(label="删除目标", command=lambda tid=item_id: self.delete_target_by_id(tid))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _check_single_target(self, target_name: str) -> None:
+        count = self.monitor.check_now(target_name)
+        self.status_var.set(f"正在检测：{target_name}" if count else f"检测已在进行：{target_name}")
+
+    def add_target(self) -> None:
+        existing_names = {str(t.get("name", "")) for t in self.targets}
+
+        def on_commit(new_target: dict[str, Any]) -> None:
+            updated = [item.copy() for item in self.targets]
+            updated.append(normalize_target(new_target))
+            self._save_config(updated, self.settings, notify=False)
+            self.status_var.set(f"已添加目标：{new_target['name']}")
+
+        TargetEditDialog(
+            self.root,
+            existing_names=existing_names,
+            available_groups=self._available_groups(),
+            settings=self.settings,
+            on_commit=on_commit,
+        )
+
+    def edit_target_by_id(self, target_id: str) -> None:
+        index = self._find_target_index(target_id)
+        if index is None:
+            return
+        existing = self.targets[index]
+        existing_names = {str(t.get("name", "")) for pos, t in enumerate(self.targets) if pos != index}
+
+        def on_commit(edited: dict[str, Any]) -> None:
+            updated = [item.copy() for item in self.targets]
+            updated[index] = normalize_target(edited)
+            self._save_config(updated, self.settings, notify=False)
+            self.status_var.set(f"已更新目标：{edited['name']}")
+
+        TargetEditDialog(
+            self.root,
+            existing=existing,
+            existing_names=existing_names,
+            available_groups=self._available_groups(),
+            settings=self.settings,
+            on_commit=on_commit,
+        )
+
+    def duplicate_target_by_id(self, target_id: str) -> None:
+        index = self._find_target_index(target_id)
+        if index is None:
+            return
+        clone = normalize_target(self.targets[index])
+        clone["name"] = f"{clone['name']} - 副本"
+        existing_names = {str(t.get("name", "")) for t in self.targets}
+
+        def on_commit(new_target: dict[str, Any]) -> None:
+            updated = [item.copy() for item in self.targets]
+            updated.append(normalize_target(new_target))
+            self._save_config(updated, self.settings, notify=False)
+            self.status_var.set(f"已复制目标：{new_target['name']}")
+
+        TargetEditDialog(
+            self.root,
+            existing=clone,
+            existing_names=existing_names,
+            available_groups=self._available_groups(),
+            settings=self.settings,
+            on_commit=on_commit,
+            title="复制监控目标",
+        )
+
+    def toggle_target_enabled(self, target_id: str) -> None:
+        index = self._find_target_index(target_id)
+        if index is None:
+            return
+        updated = [item.copy() for item in self.targets]
+        new_enabled = not as_bool(updated[index].get("enabled", True))
+        updated[index]["enabled"] = new_enabled
+        name = updated[index].get("name", "")
+        self._save_config(updated, self.settings, notify=False)
+        self.status_var.set(f"已{'启用' if new_enabled else '停用'}目标：{name}")
+
+    def delete_target_by_id(self, target_id: str) -> None:
+        index = self._find_target_index(target_id)
+        if index is None:
+            return
+        name = self.targets[index].get("name", "")
+        if not messagebox.askyesno("确认删除", f"确定删除监控目标「{name}」吗？", parent=self.root):
+            return
+        updated = [item.copy() for pos, item in enumerate(self.targets) if pos != index]
+        self._save_config(updated, self.settings, notify=False)
+        self.status_var.set(f"已删除目标：{name}")
+
+    def open_batch_import(self) -> None:
+        existing_names = {str(t.get("name", "")) for t in self.targets}
+
+        def on_import(created: list[dict[str, Any]]) -> None:
+            updated = [item.copy() for item in self.targets]
+            updated.extend(created)
+            self._save_config(updated, self.settings, notify=False)
+            self.status_var.set(f"已批量导入 {len(created)} 个目标")
+
+        BatchImportDialog(
+            self.root,
+            existing_names=existing_names,
+            available_groups=self._available_groups(),
+            on_import=on_import,
+        )
+
+    def open_target_in_browser(self, target_id: str) -> None:
+        index = self._find_target_index(target_id)
+        if index is None:
+            return
+        addr = str(self.targets[index].get("address", "")).strip()
+        if not addr:
+            return
+        url = addr if "://" in addr else f"http://{extract_host(addr)}"
+        webbrowser.open(url)
+
+    def copy_target_address(self, target_id: str) -> None:
+        index = self._find_target_index(target_id)
+        if index is None:
+            return
+        addr = str(self.targets[index].get("address", "")).strip()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(addr)
+        self.status_var.set(f"已复制地址：{addr}")
+
     def open_config(self) -> None:
-        ConfigDialog(self.root, self.targets, self.settings, self._save_config)
+        SettingsDialog(self.root, self.settings, lambda new_settings: self._save_config(self.targets, new_settings))
 
-    def open_port_test(self) -> None:
-        PortTestDialog(self.root, self.logger)
+    def open_snmp_detail(self, target: dict[str, Any]) -> None:
+        SnmpDetailDialog(self.root, target)
 
-    def _save_config(self, targets: list[dict[str, Any]], settings: dict[str, Any]) -> None:
+    def open_target_history(self, target: dict[str, Any]) -> None:
+        TargetHistoryDialog(self.root, target, self.database)
+
+    def open_network_diag(self, initial_host: str = "", mode: str = "ping") -> None:
+        NetworkDiagDialog(self.root, initial_host=initial_host, mode=mode)
+
+    def open_ssh_terminal(self, host: str) -> None:
+        target = host.strip()
+        if not target:
+            return
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(["cmd", "/c", "start", "cmd", "/k", f"ssh {target}"])
+            else:
+                subprocess.Popen(["ssh", target])
+            self.status_var.set(f"已启动 SSH 终端：{target}")
+        except OSError as error:
+            messagebox.showerror("启动失败", f"无法启动 SSH 终端：{error}", parent=self.root)
+
+    def open_rdp_session(self, host: str) -> None:
+        target = host.strip()
+        if not target:
+            return
+        if sys.platform != "win32":
+            messagebox.showinfo("提示", "远程桌面 (mstsc) 仅支持 Windows 系统。", parent=self.root)
+            return
+        try:
+            subprocess.Popen(["mstsc", f"/v:{target}"])
+            self.status_var.set(f"已启动远程桌面：{target}")
+        except OSError as error:
+            messagebox.showerror("启动失败", f"无法启动远程桌面：{error}", parent=self.root)
+
+    def mute_target_by_id(self, target_id: str, minutes: int) -> None:
+        index = self._find_target_index(target_id)
+        if index is None:
+            return
+        updated = [item.copy() for item in self.targets]
+        name = updated[index].get("name", "")
+        if minutes <= 0:
+            updated[index].pop("muted_until", None)
+            self._save_config(updated, self.settings, notify=False)
+            self.status_var.set(f"已取消静默：{name}")
+            return
+        until = datetime.now() + timedelta(minutes=minutes)
+        updated[index]["muted_until"] = until.isoformat(timespec="seconds")
+        self._save_config(updated, self.settings, notify=False)
+        self.status_var.set(f"已静默 {name} 至 {until.strftime('%H:%M')}")
+
+    def export_config_zip(self) -> None:
+        redact = messagebox.askyesno(
+            "配置脱敏选项",
+            "是否在导出时清除企业微信 Webhook 和 SNMP Community 等敏感凭据？\n（选“否”将保留完整配置用于本机迁移）",
+            parent=self.root,
+        )
+        destination = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="备份配置包",
+            defaultextension=".zip",
+            filetypes=[("ZIP 压缩包", "*.zip")],
+            initialfile=f"network_monitor_backup_{datetime.now().strftime('%Y%m%d')}.zip",
+        )
+        if not destination:
+            return
+        try:
+            export_config_bundle(Path(destination), self.targets, self.settings, redact_secrets=redact)
+            messagebox.showinfo("备份完成", f"配置包已保存至：\n{destination}", parent=self.root)
+        except OSError as error:
+            self.logger.exception("导出配置包失败")
+            messagebox.showerror("备份失败", str(error), parent=self.root)
+
+    def import_config_zip(self) -> None:
+        source = filedialog.askopenfilename(
+            parent=self.root,
+            title="导入配置包",
+            filetypes=[("ZIP 压缩包", "*.zip")],
+        )
+        if not source:
+            return
+        try:
+            new_targets, new_settings = import_config_bundle(Path(source))
+        except Exception as error:
+            messagebox.showerror("导入失败", f"无法读取配置包：{error}", parent=self.root)
+            return
+        if not messagebox.askyesno(
+            "确认覆盖当前配置",
+            f"配置包包含 {len(new_targets)} 个监控目标，导入将覆盖当前配置并立即生效，是否继续？",
+            parent=self.root,
+        ):
+            return
+        self._save_config([normalize_target(t) for t in new_targets], new_settings, notify=True)
+
+    def open_snmp_discovery(self) -> None:
+        existing_addresses = {str(t.get("address", "")).strip() for t in self.targets}
+        existing_names = {str(t.get("name", "")) for t in self.targets}
+
+        def on_import(created: list[dict[str, Any]]) -> None:
+            updated = [item.copy() for item in self.targets]
+            updated.extend(created)
+            self._save_config(updated, self.settings, notify=False)
+            self.status_var.set(f"已通过 SNMP 发现导入 {len(created)} 台设备")
+
+        SnmpDiscoveryDialog(
+            self.root,
+            existing_addresses=existing_addresses,
+            existing_names=existing_names,
+            available_groups=self._available_groups(),
+            on_import=on_import,
+        )
+
+    def open_port_test(self, initial_host: str = "") -> None:
+        PortTestDialog(self.root, self.logger, initial_host=initial_host)
+
+    def _save_config(self, targets: list[dict[str, Any]], settings: dict[str, Any], *, notify: bool = True) -> None:
         previous_settings = getattr(self, "settings", {})
         previous_flash_enabled = as_bool(previous_settings.get("desktop_alert_flash_enabled", True))
         self.targets, self.settings = targets, settings
@@ -824,7 +1235,8 @@ class MainWindow:
         self._history_rows = {}
         self._refresh_dashboard()
         self._render_targets()
-        messagebox.showinfo("配置已保存", "监控目标和系统设置已保存。")
+        if notify:
+            messagebox.showinfo("配置已保存", "系统设置已保存。", parent=self.root)
 
     def export_report(self) -> None:
         destination = filedialog.asksaveasfilename(

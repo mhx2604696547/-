@@ -4,7 +4,7 @@ from __future__ import annotations
 import tkinter as tk
 import unittest
 
-from app.gui.monitor_wall import MonitorWallPanel, wall_view_state
+from app.gui.monitor_wall import MonitorWallPanel, paginate_targets, parse_snmp_metrics, wall_view_state
 
 
 def _snapshot() -> dict[str, object]:
@@ -103,6 +103,25 @@ class MonitorWallPanelTests(unittest.TestCase):
             self.assertEqual(len(wall.incident_rows), 1)
         finally:
             root.destroy()
+
+
+class WallVisualHelperTests(unittest.TestCase):
+    def test_parses_snmp_cpu_memory_and_switch_ports(self) -> None:
+        server = parse_snmp_metrics("设备名：app-01，CPU 35%，内存 68%")
+        self.assertEqual(server["cpu"], 35.0)
+        self.assertEqual(server["mem"], 68.0)
+
+        switch = parse_snmp_metrics("设备名：core-sw1，端口 24 个：18 up，6 down")
+        self.assertEqual(switch["ports_total"], 24)
+        self.assertEqual(switch["ports_up"], 18)
+        self.assertEqual(switch["ports_down"], 6)
+
+    def test_paginates_targets_cleanly_without_dropping_overflow(self) -> None:
+        items = [{"name": f"t-{i}"} for i in range(11)]
+        page0, idx0, total = paginate_targets(items, 0, page_size=9)
+        self.assertEqual((len(page0), idx0, total), (9, 0, 2))
+        page1, idx1, _ = paginate_targets(items, 5, page_size=9)
+        self.assertEqual((len(page1), idx1), (2, 1))
 
 
 if __name__ == "__main__":

@@ -58,13 +58,13 @@ def offer_shortcut(
 
     if not messagebox.askyesno(
         "创建桌面快捷方式",
-        "是否在桌面创建「网络监控」快捷方式，方便下次直接打开？",
+        "是否在桌面创建「网哨」快捷方式，方便下次直接打开？",
         parent=root,
     ):
         return
 
     exe_path = Path(sys.executable)
-    if _create_lnk(exe_path, "网络监控"):
+    if _create_lnk(exe_path, "网哨"):
         messagebox.showinfo("完成", "桌面快捷方式已创建。", parent=root)
         logger.info("已在桌面创建快捷方式")
     else:

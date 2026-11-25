@@ -623,3 +623,70 @@ class MonitorDatabase:
             ).fetchall()
         finally:
             connection.close()
+
+    def get_target_history(
+        self, target: dict[str, Any], *, hours: int = 24, limit: int = 300,
+    ) -> list[dict[str, Any]]:
+        """Return chronological check history for one target within the last N hours."""
+        cutoff = (datetime.now() - timedelta(hours=max(1, int(hours)))).isoformat(timespec="seconds")
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """SELECT status, latency, error_msg, detail, check_time
+                FROM check_history
+                WHERE target_name = ? AND target_addr = ? AND check_type = ? AND check_time >= ?
+                ORDER BY check_time DESC LIMIT ?""",
+                (target["name"], target["address"], str(target["check_type"]).lower(), cutoff, max(1, int(limit))),
+            ).fetchall()
+            rows.reverse()
+            return [
+                {
+                    "status": str(r[0]),
+                    "latency": r[1],
+                    "error_msg": str(r[2] or ""),
+                    "detail": str(r[3] or ""),
+                    "check_time": str(r[4] or ""),
+                }
+                for r in rows
+            ]
+        finally:
+            connection.close()
+
+
+def extract_status_transitions(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Extract state-change events (up <-> down) with estimated durations from chronological records."""
+    events: list[dict[str, Any]] = []
+    prev_status: str | None = None
+    prev_time: datetime | None = None
+    for rec in records:
+        status = str(rec.get("status", "unknown"))
+        raw_time = str(rec.get("check_time", ""))
+        cur_dt: datetime | None = None
+        if raw_time:
+            try:
+                cur_dt = datetime.fromisoformat(raw_time)
+            except ValueError:
+                cur_dt = None
+        if prev_status is not None and status != prev_status:
+            duration_text = "-"
+            if prev_time is not None and cur_dt is not None:
+                secs = max(0, int((cur_dt - prev_time).total_seconds()))
+                if secs >= 3600:
+                    duration_text = f"{secs // 3600}小时{(secs % 3600) // 60}分"
+                elif secs >= 60:
+                    duration_text = f"{secs // 60}分{secs % 60}秒"
+                else:
+                    duration_text = f"{secs}秒"
+            events.append({
+                "time": raw_time.replace("T", " "),
+                "from_status": prev_status,
+                "to_status": status,
+                "duration": duration_text,
+                "error_msg": str(rec.get("error_msg") or ""),
+            })
+            prev_time = cur_dt
+        elif prev_status is None:
+            prev_time = cur_dt
+        prev_status = status
+    events.reverse()
+    return events

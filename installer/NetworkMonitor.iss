@@ -2,7 +2,7 @@
 ; Runtime data is deliberately not listed in [Files] or [UninstallDelete].
 ; This preserves config, SQLite history, and logs across upgrades/uninstalls.
 
-#define MyAppName "Network Monitor"
+#define MyAppName "网哨"
 #define MyAppVersion "1.0.0"
 #define MyAppPublisher "Ma Haixing"
 #define MyAppExeName "NetworkMonitor.exe"

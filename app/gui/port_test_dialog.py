@@ -13,12 +13,13 @@ from app.core import port_scan
 class PortTestDialog(tk.Toplevel):
     """Lets an operator manually test whether one or more TCP ports are open."""
 
-    def __init__(self, parent: tk.Misc, logger: Any) -> None:
+    def __init__(self, parent: tk.Misc, logger: Any, initial_host: str = "") -> None:
         super().__init__(parent)
         self.title("端口测试工具")
         self.resizable(True, True)
         self.transient(parent)
         self.logger = logger
+        self._initial_host = initial_host.strip()
         self._stop_event: threading.Event | None = None
         self._result_queue: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._total = 0
@@ -33,7 +34,7 @@ class PortTestDialog(tk.Toplevel):
         form = ttk.Frame(body)
         form.pack(fill=tk.X)
         form.columnconfigure(1, weight=1)
-        self.host_var = tk.StringVar(value="")
+        self.host_var = tk.StringVar(value=self._initial_host)
         self.ports_var = tk.StringVar(value="80,443")
         self.timeout_var = tk.StringVar(value="1.5")
         ttk.Label(form, text="主机地址").grid(row=0, column=0, sticky=tk.W, padx=(0, 10), pady=3)

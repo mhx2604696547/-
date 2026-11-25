@@ -127,11 +127,39 @@ class CheckTests(unittest.TestCase):
     def test_server_role_adds_host_resource_summary_to_detail(self) -> None:
         with patch.object(snmp_check, "getCmd", AsyncMock(return_value=self._base_success_response())), \
              patch.object(snmp_check, "_fetch_cpu_percent", AsyncMock(return_value=75.0)), \
-             patch.object(snmp_check, "_fetch_memory_percent", AsyncMock(return_value=40.0)):
+             patch.object(snmp_check, "_fetch_memory_percent", AsyncMock(return_value=40.0)), \
+             patch.object(snmp_check, "_fetch_disks", AsyncMock(return_value=[{"name": "/", "percent": 62.0}])):
             result = snmp_check.check("192.0.2.1", device_role="server", community="public")
         self.assertEqual(result["status"], "up")
         self.assertIn("CPU 75%", result["detail"])
         self.assertIn("内存 40%", result["detail"])
+        self.assertIn("磁盘最高 62%", result["detail"])
+
+
+class SnmpEnhancementHelperTests(unittest.TestCase):
+    def test_formats_uptime_and_link_speed(self) -> None:
+        self.assertEqual(snmp_check.format_uptime(12 * 86400 * 100 + 3 * 3600 * 100), "12天3小时")
+        self.assertEqual(snmp_check.format_uptime(2 * 3600 * 100 + 15 * 60 * 100), "2小时15分")
+        self.assertEqual(snmp_check.format_uptime(45 * 60 * 100), "45分")
+        self.assertEqual(snmp_check.format_speed(1_000_000_000), "1G")
+        self.assertEqual(snmp_check.format_speed(100_000_000), "100M")
+        self.assertEqual(snmp_check.format_speed(0), "-")
+
+    def test_guesses_device_role_from_sys_descr(self) -> None:
+        self.assertEqual(snmp_check.guess_device_role("Huawei Versatile Routing Platform Software"), "switch")
+        self.assertEqual(snmp_check.guess_device_role("Linux app-node 6.1.0 Ubuntu"), "server")
+        self.assertEqual(snmp_check.guess_device_role("Custom Printer Appliance"), "other")
+
+    def test_discover_snmp_devices_collects_responding_hosts(self) -> None:
+        def fake_probe(addr: str, *_args: object):
+            if addr == "192.168.1.1":
+                return {"address": addr, "sys_name": "SW-01", "sys_descr": "H3C Switch", "uptime": "3天1小时", "device_role": "switch", "latency": 4.2}
+            return None
+
+        with patch.object(snmp_check, "_probe_discovery_host", side_effect=fake_probe):
+            found = snmp_check.discover_snmp_devices(["192.168.1.1", "192.168.1.2"], community="public")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["sys_name"], "SW-01")
 
 
 class NonAsciiHostnameRegressionTests(unittest.TestCase):
